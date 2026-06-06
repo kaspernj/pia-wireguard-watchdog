@@ -1,0 +1,8 @@
+Package: pia-wireguard-watchdog
+Version: 0.1.1-1
+Architecture: all
+Maintainer: dizzy
+Depends: procd, wireguard-tools, kmod-wireguard, curl, jq, jsonfilter
+Section: net
+Priority: optional
+Description: OpenWrt procd service that provisions and watches a PIA WireGuard client

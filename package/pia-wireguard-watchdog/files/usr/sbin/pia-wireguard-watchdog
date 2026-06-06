@@ -1,0 +1,256 @@
+#!/bin/sh
+set -eu
+
+CONFIG_PACKAGE="pia-wireguard"
+CONFIG_SECTION="main"
+STATE_DIR="/var/run/pia-wireguard"
+TAG="pia-wireguard"
+PROVISIONER="/usr/sbin/pia-wireguard-provision"
+
+log() {
+	logger -t "$TAG" "$*"
+}
+
+uci_get() {
+	uci -q get "$1" 2>/dev/null || true
+}
+
+default_number() {
+	local value="$1"
+	local default="$2"
+
+	case "$value" in
+		""|*[!0-9]*)
+			printf "%s\n" "$default"
+		;;
+		*)
+			printf "%s\n" "$value"
+		;;
+	esac
+}
+
+status_value() {
+	printf "%s\n" "$1" | tr '\n\r' '  '
+}
+
+load_config() {
+	ENABLED="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.enabled")"
+	INTERFACE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.interface")"
+	CHECK_INTERVAL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.check_interval")"
+	HANDSHAKE_MAX_AGE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.handshake_max_age")"
+	RESTORE_TIMEOUT="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.restore_timeout")"
+	RESTART_DELAY="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.restart_delay")"
+	PING_TIMEOUT="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.ping_timeout")"
+	RECONFIGURE_MIN_INTERVAL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.reconfigure_min_interval")"
+	EGRESS_CHECK_ENABLED="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.egress_check_enabled")"
+	EGRESS_CHECK_URL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.egress_check_url")"
+	STATUS_FILE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.status_file")"
+
+	[ -n "$ENABLED" ] || ENABLED="1"
+	[ -n "$INTERFACE" ] || INTERFACE="wg0_pia"
+	CHECK_INTERVAL="$(default_number "$CHECK_INTERVAL" 60)"
+	HANDSHAKE_MAX_AGE="$(default_number "$HANDSHAKE_MAX_AGE" 180)"
+	RESTORE_TIMEOUT="$(default_number "$RESTORE_TIMEOUT" 30)"
+	RESTART_DELAY="$(default_number "$RESTART_DELAY" 5)"
+	PING_TIMEOUT="$(default_number "$PING_TIMEOUT" 3)"
+	RECONFIGURE_MIN_INTERVAL="$(default_number "$RECONFIGURE_MIN_INTERVAL" 900)"
+	[ -n "$EGRESS_CHECK_ENABLED" ] || EGRESS_CHECK_ENABLED="1"
+	[ -n "$EGRESS_CHECK_URL" ] || EGRESS_CHECK_URL="https://api.ipify.org"
+	[ -n "$STATUS_FILE" ] || STATUS_FILE="$STATE_DIR/status"
+}
+
+interface_is_up() {
+	[ "$(ifstatus "$INTERFACE" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null || true)" = "true" ]
+}
+
+latest_handshake() {
+	wg show "$INTERFACE" latest-handshakes 2>/dev/null |
+		awk 'NR == 1 { print $2 }'
+}
+
+handshake_is_recent() {
+	local latest
+	local now
+
+	latest="$(latest_handshake)"
+	case "$latest" in
+		""|0|*[!0-9]*)
+			HANDSHAKE_AGE="missing"
+			return 1
+		;;
+	esac
+
+	now="$(date +%s)"
+	HANDSHAKE_AGE=$((now - latest))
+	[ "$HANDSHAKE_AGE" -le "$HANDSHAKE_MAX_AGE" ]
+}
+
+egress_check() {
+	local response
+
+	if [ "$EGRESS_CHECK_ENABLED" != "1" ]; then
+		EGRESS_RESULT="disabled"
+		return 0
+	fi
+
+	response="$(curl -fsS --interface "$INTERFACE" --connect-timeout "$PING_TIMEOUT" --max-time "$RESTORE_TIMEOUT" "$EGRESS_CHECK_URL" 2>&1)" || {
+		EGRESS_RESULT="failed: $response"
+		return 1
+	}
+
+	EGRESS_RESULT="ok: $response"
+	return 0
+}
+
+is_healthy() {
+	HEALTH_REASON="healthy"
+	HANDSHAKE_AGE="unknown"
+	EGRESS_RESULT="not_checked"
+
+	if ! interface_is_up; then
+		HEALTH_REASON="interface_down"
+		return 1
+	fi
+
+	if ! handshake_is_recent; then
+		HEALTH_REASON="stale_handshake:$HANDSHAKE_AGE"
+		return 1
+	fi
+
+	if ! egress_check; then
+		HEALTH_REASON="egress_failed"
+		return 1
+	fi
+
+	return 0
+}
+
+write_status() {
+	local state="$1"
+	local action="$2"
+	local now
+	local status_dir
+
+	now="$(date +%s)"
+	status_dir="${STATUS_FILE%/*}"
+	[ "$status_dir" != "$STATUS_FILE" ] || status_dir="."
+	mkdir -p "$status_dir"
+
+	{
+		printf "timestamp=%s\n" "$now"
+		printf "state=%s\n" "$state"
+		printf "interface=%s\n" "$INTERFACE"
+		printf "reason=%s\n" "$(status_value "${HEALTH_REASON:-unknown}")"
+		printf "handshake_age=%s\n" "$(status_value "${HANDSHAKE_AGE:-unknown}")"
+		printf "egress_result=%s\n" "$(status_value "${EGRESS_RESULT:-unknown}")"
+		printf "last_action=%s\n" "$action"
+	} > "$STATUS_FILE"
+}
+
+needs_provision() {
+	[ "$(uci_get "network.$INTERFACE.disabled")" = "1" ] && return 0
+	[ -n "$(uci_get "network.$INTERFACE.private_key")" ] || return 0
+	[ -n "$(uci_get "network.$INTERFACE.addresses")" ] || return 0
+	uci show network 2>/dev/null | grep -q "^network\\.[^=]*=wireguard_${INTERFACE}$" || return 0
+	return 1
+}
+
+can_provision() {
+	local last
+	local now
+
+	needs_provision && return 0
+
+	last="$(cat "$STATE_DIR/last_provision" 2>/dev/null || true)"
+	case "$last" in
+		""|*[!0-9]*)
+			return 0
+		;;
+	esac
+
+	now="$(date +%s)"
+	[ $((now - last)) -ge "$RECONFIGURE_MIN_INTERVAL" ]
+}
+
+wait_until_healthy() {
+	local deadline
+
+	deadline=$(($(date +%s) + RESTORE_TIMEOUT))
+	while [ "$(date +%s)" -le "$deadline" ]; do
+		is_healthy && return 0
+		sleep 2
+	done
+
+	return 1
+}
+
+restart_interface() {
+	log "$INTERFACE is unhealthy ($HEALTH_REASON; handshake_age=$HANDSHAKE_AGE; egress=$EGRESS_RESULT); restarting interface"
+	ifdown "$INTERFACE" >/dev/null 2>&1 || true
+	sleep "$RESTART_DELAY"
+	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
+}
+
+run_provisioner() {
+	log "$INTERFACE needs PIA provisioning"
+	"$PROVISIONER"
+}
+
+main_loop() {
+	local last_state
+
+	last_state="unknown"
+	mkdir -p "$STATE_DIR"
+	log "watchdog started"
+
+	while :; do
+		load_config
+
+		if [ "$ENABLED" != "1" ]; then
+			[ "$last_state" = "disabled" ] || log "watchdog disabled by config"
+			last_state="disabled"
+			write_status disabled none
+			sleep "$CHECK_INTERVAL"
+			continue
+		fi
+
+		if is_healthy; then
+			[ "$last_state" = "healthy" ] || log "$INTERFACE is healthy"
+			last_state="healthy"
+			write_status healthy none
+			sleep "$CHECK_INTERVAL"
+			continue
+		fi
+
+		[ "$last_state" = "unhealthy" ] || log "$INTERFACE is unhealthy ($HEALTH_REASON; handshake_age=$HANDSHAKE_AGE; egress=$EGRESS_RESULT)"
+		last_state="unhealthy"
+		write_status unhealthy restart_interface
+
+		if restart_interface && wait_until_healthy; then
+			log "$INTERFACE recovered after interface restart"
+			last_state="healthy"
+			write_status healthy recovered_after_restart
+			sleep "$CHECK_INTERVAL"
+			continue
+		fi
+
+		if can_provision; then
+			write_status unhealthy provision
+			if run_provisioner && wait_until_healthy; then
+				log "$INTERFACE recovered after PIA provisioning"
+				last_state="healthy"
+				write_status healthy recovered_after_provision
+			else
+				log "$INTERFACE is still unhealthy after provisioning attempt"
+				write_status unhealthy provision_failed
+			fi
+		else
+			log "$INTERFACE provisioning is rate-limited"
+			write_status unhealthy provision_rate_limited
+		fi
+
+		sleep "$CHECK_INTERVAL"
+	done
+}
+
+main_loop "$@"

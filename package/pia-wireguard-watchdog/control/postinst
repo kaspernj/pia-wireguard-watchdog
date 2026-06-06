@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+SECRETS_FILE="/etc/pia-wireguard.secrets"
+CONFIG_PACKAGE="pia-wireguard"
+CONFIG_SECTION="main"
+
+if [ ! -e "$SECRETS_FILE" ]; then
+  umask 077
+  {
+    printf "# Private Internet Access credentials for pia-wireguard-watchdog.\n"
+    printf "PIA_USER=\"\"\n"
+    printf "PIA_PASS=\"\"\n"
+  } > "$SECRETS_FILE"
+fi
+
+chmod 0600 "$SECRETS_FILE"
+
+uci_default() {
+  local key="$1"
+  local value="$2"
+
+  [ -n "$(uci -q get "$CONFIG_PACKAGE.$CONFIG_SECTION.$key" 2>/dev/null || true)" ] && return 0
+  uci set "$CONFIG_PACKAGE.$CONFIG_SECTION.$key=$value"
+}
+
+uci_default enabled 1
+uci_default interface wg0_pia
+uci_default region swiss
+uci_default check_interval 60
+uci_default handshake_max_age 180
+uci_default restore_timeout 30
+uci_default restart_delay 5
+uci_default ping_timeout 3
+uci_default reconfigure_min_interval 900
+uci_default egress_check_enabled 1
+uci_default egress_check_url https://api.ipify.org
+uci_default status_file /var/run/pia-wireguard/status
+uci_default mtu 1250
+uci_default allowed_ips 0.0.0.0/0
+uci_default persistent_keepalive 25
+uci_default serverlist_url https://serverlist.piaservers.net/vpninfo/servers/v6
+uci_default token_url https://www.privateinternetaccess.com/api/client/v2/token
+uci_default add_key_port 1337
+uci commit "$CONFIG_PACKAGE" >/dev/null 2>&1 || true
+
+if [ -x /etc/init.d/pia-wireguard-watchdog ]; then
+  /etc/init.d/pia-wireguard-watchdog enable >/dev/null 2>&1 || true
+fi
+
+exit 0

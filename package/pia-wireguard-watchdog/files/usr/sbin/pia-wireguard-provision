@@ -1,0 +1,167 @@
+#!/bin/sh
+set -eu
+
+CONFIG_PACKAGE="pia-wireguard"
+CONFIG_SECTION="main"
+SECRETS_FILE="/etc/pia-wireguard.secrets"
+STATE_DIR="/var/run/pia-wireguard"
+LOCK_FILE="$STATE_DIR/provision.lock"
+TAG="pia-wireguard"
+
+log() {
+	logger -t "$TAG" "$*"
+}
+
+die() {
+	log "provision failed: $*"
+	exit 1
+}
+
+uci_get() {
+	uci -q get "$1" 2>/dev/null || true
+}
+
+default_number() {
+	local value="$1"
+	local default="$2"
+
+	case "$value" in
+		""|*[!0-9]*)
+			printf "%s\n" "$default"
+		;;
+		*)
+			printf "%s\n" "$value"
+		;;
+	esac
+}
+
+load_config() {
+	INTERFACE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.interface")"
+	REGION="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.region")"
+	MTU="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.mtu")"
+	ALLOWED_IPS="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.allowed_ips")"
+	PERSISTENT_KEEPALIVE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.persistent_keepalive")"
+	SERVERLIST_URL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.serverlist_url")"
+	TOKEN_URL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.token_url")"
+	ADD_KEY_PORT="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.add_key_port")"
+
+	[ -n "$INTERFACE" ] || INTERFACE="wg0_pia"
+	[ -n "$REGION" ] || REGION="swiss"
+	MTU="$(default_number "$MTU" 1250)"
+	[ -n "$ALLOWED_IPS" ] || ALLOWED_IPS="0.0.0.0/0"
+	PERSISTENT_KEEPALIVE="$(default_number "$PERSISTENT_KEEPALIVE" 25)"
+	[ -n "$SERVERLIST_URL" ] || SERVERLIST_URL="https://serverlist.piaservers.net/vpninfo/servers/v6"
+	[ -n "$TOKEN_URL" ] || TOKEN_URL="https://www.privateinternetaccess.com/api/client/v2/token"
+	ADD_KEY_PORT="$(default_number "$ADD_KEY_PORT" 1337)"
+}
+
+load_secrets() {
+	[ -r "$SECRETS_FILE" ] || die "$SECRETS_FILE is missing or unreadable"
+	. "$SECRETS_FILE"
+
+	[ -n "${PIA_USER:-}" ] || die "PIA_USER is missing in $SECRETS_FILE"
+	[ -n "${PIA_PASS:-}" ] || die "PIA_PASS is missing in $SECRETS_FILE"
+}
+
+first_peer_section() {
+	uci show network 2>/dev/null |
+		sed -n "s/^network\\.\\([^=]*\\)=wireguard_${INTERFACE}\$/\\1/p" |
+		sed -n '1p'
+}
+
+require_value() {
+	local name="$1"
+	local value="$2"
+
+	[ -n "$value" ] || die "$name was empty"
+}
+
+main() {
+	mkdir -p "$STATE_DIR"
+	exec 9>"$LOCK_FILE"
+	flock -n 9 || die "another provision run is already active"
+
+	load_config
+	load_secrets
+
+	log "provisioning $INTERFACE for PIA region $REGION"
+
+	private_key="$(uci_get "network.$INTERFACE.private_key")"
+	if [ -z "$private_key" ]; then
+		private_key="$(wg genkey)" || die "could not generate WireGuard private key"
+		log "generated a new WireGuard private key for $INTERFACE"
+	fi
+	public_key="$(printf "%s\n" "$private_key" | wg pubkey)" || die "could not derive WireGuard public key"
+
+	serverlist_response="$(curl -fsS --connect-timeout 15 --max-time 30 "$SERVERLIST_URL")" ||
+		die "could not fetch PIA server list"
+	serverlist_json="$(printf "%s\n" "$serverlist_response" | sed -n '1p')"
+	require_value "PIA server list" "$serverlist_json"
+
+	region_data="$(printf "%s\n" "$serverlist_json" |
+		jq --arg REGION_ID "$REGION" -r '.regions[] | select(.id==$REGION_ID)')" ||
+		die "could not parse PIA server list"
+	require_value "PIA region $REGION" "$region_data"
+
+	wg_server_ip="$(printf "%s\n" "$region_data" | jq -r '.servers.wg[0].ip // empty')"
+	wg_hostname="$(printf "%s\n" "$region_data" | jq -r '.servers.wg[0].cn // empty')"
+	require_value "PIA WireGuard server IP" "$wg_server_ip"
+	require_value "PIA WireGuard hostname" "$wg_hostname"
+
+	token_response="$(curl -fsS --connect-timeout 15 --max-time 30 \
+		--data-urlencode "username=$PIA_USER" \
+		--data-urlencode "password=$PIA_PASS" \
+		"$TOKEN_URL")" ||
+		die "could not get PIA token"
+	token="$(printf "%s\n" "$token_response" | jq -r '.token // empty')" ||
+		die "could not parse PIA token response"
+	require_value "PIA token" "$token"
+
+	wireguard_json="$(curl -fsSkG --connect-timeout 15 --max-time 30 \
+		--data-urlencode "pt=$token" \
+		--data-urlencode "pubkey=$public_key" \
+		"https://$wg_server_ip:$ADD_KEY_PORT/addKey")" ||
+		die "could not register WireGuard key with PIA"
+
+	dns_server="$(printf "%s\n" "$wireguard_json" | jq -r '.dns_servers[0] // empty')"
+	vpn_address="$(printf "%s\n" "$wireguard_json" | jq -r '.peer_ip // empty')"
+	vpn_port="$(printf "%s\n" "$wireguard_json" | jq -r '.server_port // empty')"
+	vpn_public_key="$(printf "%s\n" "$wireguard_json" | jq -r '.server_key // empty')"
+	require_value "PIA DNS server" "$dns_server"
+	require_value "PIA peer address" "$vpn_address"
+	require_value "PIA server port" "$vpn_port"
+	require_value "PIA server public key" "$vpn_public_key"
+
+	peer_section="$(first_peer_section)"
+	if [ -z "$peer_section" ]; then
+		peer_section="$(uci add network "wireguard_$INTERFACE")" ||
+			die "could not create WireGuard peer section"
+	fi
+
+	uci set "network.$INTERFACE=interface"
+	uci set "network.$INTERFACE.proto=wireguard"
+	uci set "network.$INTERFACE.private_key=$private_key"
+	uci set "network.$INTERFACE.addresses=$vpn_address"
+	uci set "network.$INTERFACE.dns=$dns_server"
+	uci set "network.$INTERFACE.mtu=$MTU"
+	uci set "network.$INTERFACE.disabled=0"
+
+	uci set "network.$peer_section.description=PIA $REGION"
+	uci set "network.$peer_section.public_key=$vpn_public_key"
+	uci set "network.$peer_section.allowed_ips=$ALLOWED_IPS"
+	uci set "network.$peer_section.persistent_keepalive=$PERSISTENT_KEEPALIVE"
+	uci set "network.$peer_section.endpoint_host=$wg_server_ip"
+	uci set "network.$peer_section.endpoint_port=$vpn_port"
+	uci set "network.$peer_section.route_allowed_ips=1"
+
+	uci commit network || die "could not commit network config"
+
+	ifdown "$INTERFACE" >/dev/null 2>&1 || true
+	ifup "$INTERFACE" >/dev/null 2>&1 || die "could not bring up $INTERFACE"
+
+	date +%s > "$STATE_DIR/last_provision"
+	log "provisioned $INTERFACE through $wg_hostname"
+}
+
+main "$@"
+
