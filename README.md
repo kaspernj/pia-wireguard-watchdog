@@ -18,8 +18,8 @@ The build writes an architecture-independent OpenWrt package to `dist/`.
 Install on an OpenWrt router:
 
 ```sh
-scp -O dist/pia-wireguard-watchdog_0.1.1-1_all.ipk root@192.168.86.7:/tmp/
-ssh root@192.168.86.7 'opkg install /tmp/pia-wireguard-watchdog_0.1.1-1_all.ipk'
+scp -O dist/pia-wireguard-watchdog_0.1.2-1_all.ipk root@192.168.86.7:/tmp/
+ssh root@192.168.86.7 'opkg install /tmp/pia-wireguard-watchdog_0.1.2-1_all.ipk'
 ```
 
 Set credentials on the router in `/etc/pia-wireguard.secrets`:

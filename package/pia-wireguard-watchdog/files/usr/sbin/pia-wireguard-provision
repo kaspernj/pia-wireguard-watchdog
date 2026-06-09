@@ -44,6 +44,10 @@ load_config() {
 	SERVERLIST_URL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.serverlist_url")"
 	TOKEN_URL="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.token_url")"
 	ADD_KEY_PORT="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.add_key_port")"
+	BOOTSTRAP_NETWORK="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.bootstrap_network")"
+	BOOTSTRAP_INTERFACE="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.bootstrap_interface")"
+	BOOTSTRAP_GATEWAY="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.bootstrap_gateway")"
+	BOOTSTRAP_DNS="$(uci_get "$CONFIG_PACKAGE.$CONFIG_SECTION.bootstrap_dns")"
 
 	[ -n "$INTERFACE" ] || INTERFACE="wg0_pia"
 	[ -n "$REGION" ] || REGION="swiss"
@@ -53,6 +57,11 @@ load_config() {
 	[ -n "$SERVERLIST_URL" ] || SERVERLIST_URL="https://serverlist.piaservers.net/vpninfo/servers/v6"
 	[ -n "$TOKEN_URL" ] || TOKEN_URL="https://www.privateinternetaccess.com/api/client/v2/token"
 	ADD_KEY_PORT="$(default_number "$ADD_KEY_PORT" 1337)"
+	[ -n "$BOOTSTRAP_NETWORK" ] || BOOTSTRAP_NETWORK="lan"
+	[ -n "$BOOTSTRAP_INTERFACE" ] || BOOTSTRAP_INTERFACE="$(uci_get "network.$BOOTSTRAP_NETWORK.device")"
+	[ -n "$BOOTSTRAP_INTERFACE" ] || BOOTSTRAP_INTERFACE="$(uci_get "network.$BOOTSTRAP_NETWORK.ifname")"
+	[ -n "$BOOTSTRAP_GATEWAY" ] || BOOTSTRAP_GATEWAY="$(uci_get "network.$BOOTSTRAP_NETWORK.gateway")"
+	[ -n "$BOOTSTRAP_DNS" ] || BOOTSTRAP_DNS="$BOOTSTRAP_GATEWAY"
 }
 
 load_secrets() {
@@ -76,6 +85,44 @@ require_value() {
 	[ -n "$value" ] || die "$name was empty"
 }
 
+url_host() {
+	printf "%s\n" "$1" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://\([^/:]*\).*#\1#p'
+}
+
+resolve_bootstrap_ipv4() {
+	local host="$1"
+
+	require_value "bootstrap DNS server" "$BOOTSTRAP_DNS"
+
+	nslookup "$host" "$BOOTSTRAP_DNS" 2>/dev/null |
+		awk '/^Address: / && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ { print $2; exit }'
+}
+
+ensure_bootstrap_route() {
+	local ip="$1"
+
+	require_value "bootstrap interface" "$BOOTSTRAP_INTERFACE"
+	require_value "bootstrap gateway" "$BOOTSTRAP_GATEWAY"
+	ip route replace "$ip" via "$BOOTSTRAP_GATEWAY" dev "$BOOTSTRAP_INTERFACE" ||
+		die "could not route $ip via $BOOTSTRAP_GATEWAY on $BOOTSTRAP_INTERFACE"
+}
+
+curl_bootstrap() {
+	local url="$1"
+	local host
+	local ip
+
+	host="$(url_host "$url")"
+	require_value "URL host for $url" "$host"
+
+	ip="$(resolve_bootstrap_ipv4 "$host")"
+	require_value "bootstrap IPv4 for $host" "$ip"
+	ensure_bootstrap_route "$ip"
+
+	curl -fsS -4 --interface "$BOOTSTRAP_INTERFACE" --resolve "$host:443:$ip" \
+		--connect-timeout 15 --max-time 30 "$url"
+}
+
 main() {
 	mkdir -p "$STATE_DIR"
 	exec 9>"$LOCK_FILE"
@@ -93,7 +140,7 @@ main() {
 	fi
 	public_key="$(printf "%s\n" "$private_key" | wg pubkey)" || die "could not derive WireGuard public key"
 
-	serverlist_response="$(curl -fsS --connect-timeout 15 --max-time 30 "$SERVERLIST_URL")" ||
+	serverlist_response="$(curl_bootstrap "$SERVERLIST_URL")" ||
 		die "could not fetch PIA server list"
 	serverlist_json="$(printf "%s\n" "$serverlist_response" | sed -n '1p')"
 	require_value "PIA server list" "$serverlist_json"
@@ -108,7 +155,14 @@ main() {
 	require_value "PIA WireGuard server IP" "$wg_server_ip"
 	require_value "PIA WireGuard hostname" "$wg_hostname"
 
-	token_response="$(curl -fsS --connect-timeout 15 --max-time 30 \
+	token_host="$(url_host "$TOKEN_URL")"
+	require_value "URL host for $TOKEN_URL" "$token_host"
+	token_ip="$(resolve_bootstrap_ipv4 "$token_host")"
+	require_value "bootstrap IPv4 for $token_host" "$token_ip"
+	ensure_bootstrap_route "$token_ip"
+
+	token_response="$(curl -fsS -4 --interface "$BOOTSTRAP_INTERFACE" --resolve "$token_host:443:$token_ip" \
+		--connect-timeout 15 --max-time 30 \
 		--data-urlencode "username=$PIA_USER" \
 		--data-urlencode "password=$PIA_PASS" \
 		"$TOKEN_URL")" ||
@@ -117,7 +171,8 @@ main() {
 		die "could not parse PIA token response"
 	require_value "PIA token" "$token"
 
-	wireguard_json="$(curl -fsSkG --connect-timeout 15 --max-time 30 \
+	ensure_bootstrap_route "$wg_server_ip"
+	wireguard_json="$(curl -fsSkG -4 --interface "$BOOTSTRAP_INTERFACE" --connect-timeout 15 --max-time 30 \
 		--data-urlencode "pt=$token" \
 		--data-urlencode "pubkey=$public_key" \
 		"https://$wg_server_ip:$ADD_KEY_PORT/addKey")" ||
@@ -164,4 +219,3 @@ main() {
 }
 
 main "$@"
-

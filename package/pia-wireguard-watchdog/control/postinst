@@ -36,6 +36,7 @@ uci_default reconfigure_min_interval 900
 uci_default egress_check_enabled 1
 uci_default egress_check_url https://api.ipify.org
 uci_default status_file /var/run/pia-wireguard/status
+uci_default bootstrap_network lan
 uci_default mtu 1250
 uci_default allowed_ips 0.0.0.0/0
 uci_default persistent_keepalive 25

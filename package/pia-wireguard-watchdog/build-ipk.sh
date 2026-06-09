@@ -3,7 +3,7 @@ set -eu
 umask 022
 
 PKG_NAME="pia-wireguard-watchdog"
-VERSION="0.1.1-1"
+VERSION="0.1.2-1"
 ARCH="all"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
