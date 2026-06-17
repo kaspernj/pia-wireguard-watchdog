@@ -30,7 +30,39 @@ default_number() {
 }
 
 status_value() {
-	printf "%s\n" "$1" | tr '\n\r' '  '
+	printf "%s" "$1" | tr '\n\r' '  '
+}
+
+provision_status_file() {
+	printf "%s/provision-status\n" "$STATE_DIR"
+}
+
+append_provision_status() {
+	local file
+	local key
+	local line
+	local value
+
+	file="$(provision_status_file)"
+	[ -r "$file" ] || return 0
+
+	while IFS= read -r line; do
+		case "$line" in
+			*=*)
+				key="${line%%=*}"
+				value="${line#*=}"
+			;;
+			*)
+				continue
+			;;
+		esac
+
+		case "$key" in
+			timestamp|state|interface|region|bootstrap_interface|bootstrap_gateways|active_bootstrap_gateway|bootstrap_dns|failed_bootstrap_gateways|last_bootstrap_failure|reason)
+				printf "provision_%s=%s\n" "$key" "$(status_value "$value")"
+			;;
+		esac
+	done < "$file"
 }
 
 load_config() {
@@ -144,6 +176,7 @@ write_status() {
 		printf "handshake_age=%s\n" "$(status_value "${HANDSHAKE_AGE:-unknown}")"
 		printf "egress_result=%s\n" "$(status_value "${EGRESS_RESULT:-unknown}")"
 		printf "last_action=%s\n" "$action"
+		append_provision_status
 	} > "$STATUS_FILE"
 }
 

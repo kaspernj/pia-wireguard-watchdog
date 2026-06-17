@@ -12,7 +12,42 @@ log() {
 	logger -t "$TAG" "$*"
 }
 
+status_value() {
+	printf "%s" "$1" | tr '\n\r' '  '
+}
+
+provision_status_file() {
+	printf "%s/provision-status\n" "$STATE_DIR"
+}
+
+write_provision_status() {
+	local file
+	local reason="$2"
+	local state="$1"
+	local status_dir
+
+	file="$(provision_status_file)"
+	status_dir="${file%/*}"
+	[ "$status_dir" != "$file" ] || status_dir="."
+	mkdir -p "$status_dir"
+
+	{
+		printf "timestamp=%s\n" "$(date +%s)"
+		printf "state=%s\n" "$(status_value "$state")"
+		printf "reason=%s\n" "$(status_value "$reason")"
+		printf "interface=%s\n" "$(status_value "${INTERFACE:-unknown}")"
+		printf "region=%s\n" "$(status_value "${REGION:-unknown}")"
+		printf "bootstrap_interface=%s\n" "$(status_value "${BOOTSTRAP_INTERFACE:-unknown}")"
+		printf "bootstrap_gateways=%s\n" "$(status_value "${BOOTSTRAP_GATEWAYS:-unknown}")"
+		printf "active_bootstrap_gateway=%s\n" "$(status_value "${ACTIVE_BOOTSTRAP_GATEWAY:-}")"
+		printf "bootstrap_dns=%s\n" "$(status_value "${BOOTSTRAP_DNS:-unknown}")"
+		printf "failed_bootstrap_gateways=%s\n" "$(status_value "${FAILED_BOOTSTRAP_GATEWAYS:-}")"
+		printf "last_bootstrap_failure=%s\n" "$(status_value "${LAST_BOOTSTRAP_FAILURE:-}")"
+	} > "$file"
+}
+
 die() {
+	write_provision_status failed "$*"
 	log "provision failed: $*"
 	exit 1
 }
@@ -60,8 +95,10 @@ load_config() {
 	[ -n "$BOOTSTRAP_NETWORK" ] || BOOTSTRAP_NETWORK="lan"
 	[ -n "$BOOTSTRAP_INTERFACE" ] || BOOTSTRAP_INTERFACE="$(uci_get "network.$BOOTSTRAP_NETWORK.device")"
 	[ -n "$BOOTSTRAP_INTERFACE" ] || BOOTSTRAP_INTERFACE="$(uci_get "network.$BOOTSTRAP_NETWORK.ifname")"
-	[ -n "$BOOTSTRAP_GATEWAY" ] || BOOTSTRAP_GATEWAY="$(uci_get "network.$BOOTSTRAP_NETWORK.gateway")"
-	[ -n "$BOOTSTRAP_DNS" ] || BOOTSTRAP_DNS="$BOOTSTRAP_GATEWAY"
+	BOOTSTRAP_NETWORK_GATEWAY="$(uci_get "network.$BOOTSTRAP_NETWORK.gateway")"
+	BOOTSTRAP_GATEWAYS="$(bootstrap_gateway_candidates)"
+	[ -n "$BOOTSTRAP_DNS" ] || BOOTSTRAP_DNS="$(uci_get "network.$BOOTSTRAP_NETWORK.dns")"
+	[ -n "$BOOTSTRAP_DNS" ] || BOOTSTRAP_DNS="9.9.9.9 1.1.1.1 8.8.8.8"
 }
 
 load_secrets() {
@@ -89,38 +126,172 @@ url_host() {
 	printf "%s\n" "$1" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://\([^/:]*\).*#\1#p'
 }
 
+is_ipv4() {
+	printf "%s\n" "$1" |
+		awk '$1 ~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+append_unique_word() {
+	local words="$1"
+	local word="$2"
+	local existing
+
+	[ -n "$word" ] || {
+		printf "%s\n" "$words"
+		return
+	}
+
+	for existing in $words; do
+		[ "$existing" = "$word" ] && {
+			printf "%s\n" "$words"
+			return
+		}
+	done
+
+	if [ -n "$words" ]; then
+		printf "%s %s\n" "$words" "$word"
+	else
+		printf "%s\n" "$word"
+	fi
+}
+
+record_bootstrap_failure() {
+	local gateway="$1"
+	local reason="$2"
+
+	FAILED_BOOTSTRAP_GATEWAYS="$(append_unique_word "${FAILED_BOOTSTRAP_GATEWAYS:-}" "$gateway")"
+	LAST_BOOTSTRAP_FAILURE="$reason"
+}
+
+bootstrap_interface_dot_one_gateway() {
+	require_value "bootstrap interface" "$BOOTSTRAP_INTERFACE"
+
+	ip -4 addr show dev "$BOOTSTRAP_INTERFACE" 2>/dev/null |
+		awk '
+			/inet / {
+				split($2, cidr, "/")
+				split(cidr[1], octets, ".")
+				if (octets[1] != "" && octets[2] != "" && octets[3] != "") {
+					print octets[1] "." octets[2] "." octets[3] ".1"
+					exit
+				}
+			}
+		'
+}
+
+bootstrap_gateway_candidates() {
+	local gateways
+	local inferred_gateway
+
+	gateways="$BOOTSTRAP_GATEWAY"
+
+	if [ -z "$gateways" ]; then
+		gateways="$(append_unique_word "$gateways" "$BOOTSTRAP_NETWORK_GATEWAY")"
+		inferred_gateway="$(bootstrap_interface_dot_one_gateway)"
+		gateways="$(append_unique_word "$gateways" "$inferred_gateway")"
+	fi
+
+	printf "%s\n" "$gateways"
+}
+
 resolve_bootstrap_ipv4() {
 	local host="$1"
+	local dns
+	local failure
+	local gateway
+	local lookup_response
+	local resolved_ip
 
+	RESOLVED_BOOTSTRAP_IP=""
 	require_value "bootstrap DNS server" "$BOOTSTRAP_DNS"
+	require_value "bootstrap gateway" "$BOOTSTRAP_GATEWAYS"
 
-	nslookup "$host" "$BOOTSTRAP_DNS" 2>/dev/null |
-		awk '/^Address: / && $2 ~ /^[0-9]+(\.[0-9]+){3}$/ { print $2; exit }'
+	for dns in $BOOTSTRAP_DNS; do
+		if ! is_ipv4 "$dns"; then
+			log "skipping non-IPv4 bootstrap DNS $dns"
+			continue
+		fi
+
+		for gateway in $BOOTSTRAP_GATEWAYS; do
+			if ! route_bootstrap_ip_via "$dns" "$gateway"; then
+				failure="bootstrap DNS $dns could not be routed via $gateway on $BOOTSTRAP_INTERFACE"
+				record_bootstrap_failure "$gateway" "$failure"
+				log "$failure"
+				continue
+			fi
+
+			lookup_response="$(nslookup "$host" "$dns" 2>/dev/null || true)"
+			resolved_ip="$(printf "%s\n" "$lookup_response" |
+				awk '/^Address: / && $2 ~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ { print $2; exit }')"
+			if [ -n "$resolved_ip" ]; then
+				ACTIVE_BOOTSTRAP_GATEWAY="$gateway"
+				RESOLVED_BOOTSTRAP_IP="$resolved_ip"
+				log "resolved $host through bootstrap DNS $dns via $gateway"
+				return 0
+			fi
+
+			failure="bootstrap DNS $dns via $gateway did not resolve $host"
+			record_bootstrap_failure "$gateway" "$failure"
+			log "$failure"
+		done
+	done
+
+	return 1
+}
+
+route_bootstrap_ip_via() {
+	local target_ip="$1"
+	local gateway="$2"
+
+	require_value "bootstrap interface" "$BOOTSTRAP_INTERFACE"
+	require_value "bootstrap gateway" "$gateway"
+	ip route replace "$target_ip" via "$gateway" dev "$BOOTSTRAP_INTERFACE"
+}
+
+route_bootstrap_ip() {
+	local target_ip="$1"
+	local gateway
+
+	if [ -n "${ACTIVE_BOOTSTRAP_GATEWAY:-}" ]; then
+		route_bootstrap_ip_via "$target_ip" "$ACTIVE_BOOTSTRAP_GATEWAY" && return 0
+	fi
+
+	require_value "bootstrap gateway" "$BOOTSTRAP_GATEWAYS"
+	for gateway in $BOOTSTRAP_GATEWAYS; do
+		if route_bootstrap_ip_via "$target_ip" "$gateway"; then
+			ACTIVE_BOOTSTRAP_GATEWAY="$gateway"
+			return 0
+		fi
+	done
+
+	return 1
 }
 
 ensure_bootstrap_route() {
-	local ip="$1"
+	local target_ip="$1"
 
-	require_value "bootstrap interface" "$BOOTSTRAP_INTERFACE"
-	require_value "bootstrap gateway" "$BOOTSTRAP_GATEWAY"
-	ip route replace "$ip" via "$BOOTSTRAP_GATEWAY" dev "$BOOTSTRAP_INTERFACE" ||
-		die "could not route $ip via $BOOTSTRAP_GATEWAY on $BOOTSTRAP_INTERFACE"
+	route_bootstrap_ip "$target_ip" ||
+		die "could not route $target_ip via bootstrap gateway on $BOOTSTRAP_INTERFACE"
 }
 
 curl_bootstrap() {
 	local url="$1"
 	local host
-	local ip
+	local resolved_ip
 
 	host="$(url_host "$url")"
 	require_value "URL host for $url" "$host"
 
-	ip="$(resolve_bootstrap_ipv4 "$host")"
-	require_value "bootstrap IPv4 for $host" "$ip"
-	ensure_bootstrap_route "$ip"
+	resolve_bootstrap_ipv4 "$host" || return 1
+	resolved_ip="$RESOLVED_BOOTSTRAP_IP"
+	require_value "bootstrap IPv4 for $host" "$resolved_ip"
+	ensure_bootstrap_route "$resolved_ip"
 
-	curl -fsS -4 --interface "$BOOTSTRAP_INTERFACE" --resolve "$host:443:$ip" \
-		--connect-timeout 15 --max-time 30 "$url"
+	BOOTSTRAP_CURL_RESPONSE="$(curl -fsS -4 --interface "$BOOTSTRAP_INTERFACE" --resolve "$host:443:$resolved_ip" \
+		--connect-timeout 15 --max-time 30 "$url")" || {
+		record_bootstrap_failure "${ACTIVE_BOOTSTRAP_GATEWAY:-}" "curl $url via ${ACTIVE_BOOTSTRAP_GATEWAY:-unknown} failed"
+		return 1
+	}
 }
 
 main() {
@@ -129,6 +300,7 @@ main() {
 	flock -n 9 || die "another provision run is already active"
 
 	load_config
+	write_provision_status running starting
 	load_secrets
 
 	log "provisioning $INTERFACE for PIA region $REGION"
@@ -140,8 +312,9 @@ main() {
 	fi
 	public_key="$(printf "%s\n" "$private_key" | wg pubkey)" || die "could not derive WireGuard public key"
 
-	serverlist_response="$(curl_bootstrap "$SERVERLIST_URL")" ||
+	curl_bootstrap "$SERVERLIST_URL" ||
 		die "could not fetch PIA server list"
+	serverlist_response="$BOOTSTRAP_CURL_RESPONSE"
 	serverlist_json="$(printf "%s\n" "$serverlist_response" | sed -n '1p')"
 	require_value "PIA server list" "$serverlist_json"
 
@@ -157,7 +330,9 @@ main() {
 
 	token_host="$(url_host "$TOKEN_URL")"
 	require_value "URL host for $TOKEN_URL" "$token_host"
-	token_ip="$(resolve_bootstrap_ipv4 "$token_host")"
+	resolve_bootstrap_ipv4 "$token_host" ||
+		die "could not resolve PIA token host"
+	token_ip="$RESOLVED_BOOTSTRAP_IP"
 	require_value "bootstrap IPv4 for $token_host" "$token_ip"
 	ensure_bootstrap_route "$token_ip"
 
@@ -165,8 +340,10 @@ main() {
 		--connect-timeout 15 --max-time 30 \
 		--data-urlencode "username=$PIA_USER" \
 		--data-urlencode "password=$PIA_PASS" \
-		"$TOKEN_URL")" ||
+		"$TOKEN_URL")" || {
+		record_bootstrap_failure "${ACTIVE_BOOTSTRAP_GATEWAY:-}" "curl $TOKEN_URL via ${ACTIVE_BOOTSTRAP_GATEWAY:-unknown} failed"
 		die "could not get PIA token"
+	}
 	token="$(printf "%s\n" "$token_response" | jq -r '.token // empty')" ||
 		die "could not parse PIA token response"
 	require_value "PIA token" "$token"
@@ -175,8 +352,10 @@ main() {
 	wireguard_json="$(curl -fsSkG -4 --interface "$BOOTSTRAP_INTERFACE" --connect-timeout 15 --max-time 30 \
 		--data-urlencode "pt=$token" \
 		--data-urlencode "pubkey=$public_key" \
-		"https://$wg_server_ip:$ADD_KEY_PORT/addKey")" ||
+		"https://$wg_server_ip:$ADD_KEY_PORT/addKey")" || {
+		record_bootstrap_failure "${ACTIVE_BOOTSTRAP_GATEWAY:-}" "curl https://$wg_server_ip:$ADD_KEY_PORT/addKey via ${ACTIVE_BOOTSTRAP_GATEWAY:-unknown} failed"
 		die "could not register WireGuard key with PIA"
+	}
 
 	dns_server="$(printf "%s\n" "$wireguard_json" | jq -r '.dns_servers[0] // empty')"
 	vpn_address="$(printf "%s\n" "$wireguard_json" | jq -r '.peer_ip // empty')"
@@ -215,6 +394,7 @@ main() {
 	ifup "$INTERFACE" >/dev/null 2>&1 || die "could not bring up $INTERFACE"
 
 	date +%s > "$STATE_DIR/last_provision"
+	write_provision_status success provisioned
 	log "provisioned $INTERFACE through $wg_hostname"
 }
 

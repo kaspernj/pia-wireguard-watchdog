@@ -1,5 +1,5 @@
 Package: pia-wireguard-watchdog
-Version: 0.1.2-1
+Version: 0.1.4-1
 Architecture: all
 Maintainer: dizzy
 Depends: procd, wireguard-tools, kmod-wireguard, curl, jq, jsonfilter
